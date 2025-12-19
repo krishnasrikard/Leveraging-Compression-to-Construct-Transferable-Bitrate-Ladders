@@ -1,0 +1,247 @@
+"""
+Calculating VIF features on uncompressed videos
+"""
+# Importing Libraires
+import numpy as np
+import pandas as pd
+import cv2
+
+import os,sys,warnings
+warnings.filterwarnings("ignore")
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import argparse
+import joblib
+import features.VIF as VIF
+import functions.IO_functions as IO_functions
+import defaults
+
+
+# Resize Video
+def resize_video(
+	original_video:np.array,
+	resize_dimensions:any
+):
+	"""
+	Args:
+		original_video (np.array): Original numpy video.
+		resize_dimensions (any): Resize video to given dimensions (width, height).
+	"""
+	# Dimension
+	width = original_video.shape[2]
+	height = original_video.shape[1]
+
+	# Skip if original video has same dimensions as resize dimensions
+	if resize_dimensions[0] == width and resize_dimensions[1] == height:
+		# Logging
+		print ("Original Video Dimensions = Resize Dimensions = {}".format(resize_dimensions))
+
+		return original_video
+	
+	# Resizing
+	video = []
+	for i in range(original_video.shape[0]):
+		video.append(
+			cv2.resize(original_video[i], dsize=(resize_dimensions[0], resize_dimensions[1]), interpolation=cv2.INTER_LANCZOS4)
+		)
+
+	video = np.array(video)
+
+	# Assertions
+	assert (video.dtype == np.uint8) and (np.min(video) >= 0 and np.max(video) <= 255), "Input Image/Videos should of type uint8 and should have range [0,255]."
+
+	# Logging
+	print ("Original Video Dimensions = {}".format((width, height)))
+	print ("Resized Video Dimensions = {}".format((video.shape[2], video.shape[1])))
+
+	return video
+
+
+
+# Feature Extraction from Video
+def extract_vif_features(uncompressed_raw_video_path, input_resolution, input_pixelformat, reference_features_save_path):
+	"""
+	Extract VIF features from uncompressed video.
+	Args:
+		uncompressed_raw_video_path (str): Path to uncompressed video.
+		input_resolution (Tuple): Resolution of YUV file. (Default: None)
+		input_pixelformat (str): Pixel-Format of YUV file. (Default: None)
+		reference_features_save_path (str): Path to save extracted features.
+	"""
+	# Reference Video
+	yuv_reader = IO_functions.YUV_Reader(
+		filepath=uncompressed_raw_video_path,
+		width=input_resolution[0],
+		height=input_resolution[1],
+		yuv_type=input_pixelformat
+	)
+	video = yuv_reader.get_RGB_video()
+
+	# Resize Video
+	video = resize_video(original_video=np.copy(video), resize_dimensions=(3840,2160))
+
+	# Initializing VIF
+	VIF_Function = VIF.Compute_VIF()
+
+	# Computing Reference Video Features
+	Reference_Video_Features = []
+
+	# Iterating for each frame
+	for i in range(video.shape[0]):
+		# Calculating VIF features
+		frame = np.copy(video[i])
+
+		# Luma Component of current frame
+		# Converting to int32 to avoid overflow during operations.
+		frame = cv2.cvtColor(frame, cv2.COLOR_RGB2YUV)[:,:,0]
+		frame = frame.astype(np.int32)
+
+		# Assertion
+		assert (frame.dtype == np.int32) and (np.min(frame) >= 0 and np.max(frame) <= 255), "Before calculation frame should of type uint8 and should have range [0,255]."
+
+
+		# Decomposation
+		vif_pyr_ref, vif_subband_keys = VIF_Function.Decomposation(frame)
+		vif_subband_keys.sort(reverse=True)
+
+		# GSM Model
+		[vif_S_squared_all, vif_EigenValues_all] = VIF_Function.GSM_Model(vif_pyr_ref, vif_subband_keys)
+
+		# Information in each subband along each eigen value
+		vif_features_reference = VIF_Function.Reference_Subband_Eigen_Information_Matrix(
+			subband_keys=vif_subband_keys, S_squared_all=vif_S_squared_all, EigenValues_all=vif_EigenValues_all
+		)
+
+
+		# Calculating Diff-VIF (T-VIF) Features
+		if i == 0:
+			current_frame = np.zeros(video[i].shape, dtype=np.uint8)
+			previous_frame = np.zeros(video[i].shape, dtype=np.uint8)
+		else:
+			current_frame = np.copy(video[i])
+			previous_frame = np.copy(video[i-1])
+
+		# Luma Component of current frame
+		# Converting to int32 to avoid overflow during operations.
+		current_frame = cv2.cvtColor(current_frame, cv2.COLOR_RGB2YUV)[:,:,0]
+		current_frame = current_frame.astype(np.int32)
+			
+		# Luma Component of previous frame
+		# Converting to int32 to avoid overflow during operations.
+		previous_frame = cv2.cvtColor(previous_frame, cv2.COLOR_RGB2YUV)[:,:,0]
+		previous_frame = previous_frame.astype(np.int32)
+
+		# Assertions
+		assert (current_frame.dtype == np.int32) and (np.min(current_frame) >= 0 and np.max(current_frame) <= 255), "Before calculation frame should of type int32 and should have range [0,255]."
+		assert (previous_frame.dtype == np.int32) and (np.min(previous_frame) >= 0 and np.max(previous_frame) <= 255), "Before calculation frame should of type int32 and should have range [0,255]."
+
+		# Frame Difference
+		diff_frame = np.copy(current_frame - previous_frame)
+
+
+		# Decomposation
+		diff_vif_pyr_ref, diff_vif_subband_keys = VIF_Function.Decomposation(diff_frame)
+		diff_vif_subband_keys.sort(reverse=True)
+
+		# GSM Model
+		[diff_vif_S_squared_all, diff_vif_EigenValues_all] = VIF_Function.GSM_Model(diff_vif_pyr_ref, diff_vif_subband_keys)
+
+		# Information in each subband along each eigen value
+		diff_vif_features_reference = VIF_Function.Reference_Subband_Eigen_Information_Matrix(
+			subband_keys=diff_vif_subband_keys, S_squared_all=diff_vif_S_squared_all, EigenValues_all=diff_vif_EigenValues_all
+		)
+
+		# Appending reference video features and all other parameters
+		Reference_Video_Features.append({"vif_info":vif_features_reference, "diff_vif_info":diff_vif_features_reference, "mean_abs_frame_diff":np.mean(np.abs(diff_frame))})
+
+
+	# Saving computed features
+	np.save(reference_features_save_path, np.array(Reference_Video_Features))
+	print ("Saved", reference_features_save_path)
+
+
+
+def process_video(uncompressed_raw_video_path):
+	"""
+	Process Video
+	"""
+	# Video Properties
+	df = pd.read_csv(defaults.source_dataset_info_path)
+	df = df.set_index("filename").to_dict(orient="index")
+
+	# File and Properties
+	filename = os.path.splitext(os.path.basename(uncompressed_raw_video_path))[0]
+	video_properties = df[filename]
+	print ("-"*75 + "\n" + filename + "\n" + "-"*75, flush=True)
+
+	# Path
+	reference_features_save_path = os.path.join(args.vif_features_path, filename + ".npy")
+
+	# Extract VIF features
+	if os.path.exists(reference_features_save_path):
+		# Logging
+		print (reference_features_save_path, "already exists. Skipping to next uncompressed-video.", flush=True)
+	else:
+		# Logging
+		print(f'Processing {filename}', flush=True)
+		print ("\n"*2, flush=True)
+
+		# Extract
+		extract_vif_features(
+			uncompressed_raw_video_path=uncompressed_raw_video_path, 
+			input_resolution=(video_properties["width"], video_properties["height"]),
+			input_pixelformat=video_properties["pix_fmt"],
+			reference_features_save_path=reference_features_save_path
+		)
+
+
+
+def main(args):
+	# Assertions of Paths
+	assert os.path.exists(args.raw_videos_path), "Invalid path to raw videos"
+	assert os.path.exists(args.vif_features_path), "Invalid path to save VIF information of compressed videos"
+
+	# Calculating VIF information for each uncompressed video
+	filenames = os.listdir(args.raw_videos_path)
+	joblib.Parallel(n_jobs=args.n_jobs)(joblib.delayed(process_video)(os.path.join(args.raw_videos_path, filename)) for filename in filenames)
+
+
+
+# Calling Main function
+if __name__ == '__main__':
+	root_dir = os.path.dirname(os.path.realpath(__file__))
+
+	# Get Arguments
+	parser = argparse.ArgumentParser(description='Calculating VIF features of source videos')
+
+	# Dataset Paths
+	parser.add_argument(
+		'--raw_videos_path', 
+		default=defaults.source_dataset_path, 
+		help='Path to dataset.'
+	)
+	parser.add_argument(
+		'--vif_features_path', 
+		default=defaults.vif_features_path, 
+		help='Path to information of various parameters computed during VIF quality estimation of compressed videos.'
+	)
+	
+	# Main Path
+	parser.add_argument(
+		'--main_path', 
+		default=os.path.join(defaults.main_working_dir, 'generate'), 
+		type=str, 
+		help='Path to main folder'
+	)
+
+	# Number of Parallel Jobs
+	parser.add_argument(
+		'--n_jobs', 
+		default=4, 
+		type=int, 
+		help='Number of parallel jobs. Each jobs handles one video. Recommended value ~ 0.5 * number of cores to number of cores. -1 uses n_jobs = number of cores'
+	)
+
+	# Parse Arguments
+	args = parser.parse_args()
+
+	main(args)
